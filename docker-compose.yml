@@ -1,0 +1,68 @@
+version: '3.8'
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: lfis-app
+    ports:
+      - "8080:80"
+    environment:
+      - DB_HOST=db
+      - DB_NAME=lfis_db
+      - DB_USER=lfis_user
+      - DB_PASS=lfis_pass
+      - APP_URL=http://localhost:8080
+    volumes:
+      - ./Lost-And-Found-main:/var/www/html
+      - ./docker/php/php.ini:/usr/local/etc/php/conf.d/custom.ini
+      - ./docker/apache/000-default.conf:/etc/apache2/sites-available/000-default.conf
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - lfis-network
+
+  db:
+    image: mysql:8.0
+    container_name: lfis-db
+    environment:
+      - MYSQL_ROOT_PASSWORD=root_pass
+      - MYSQL_DATABASE=lfis_db
+      - MYSQL_USER=lfis_user
+      - MYSQL_PASSWORD=lfis_pass
+    ports:
+      - "3307:3306"
+    volumes:
+      - db-data:/var/lib/mysql
+      - ./Lost-And-Found-main/database/lfis_db.sql:/docker-entrypoint-initdb.d/lfis_db.sql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - lfis-network
+
+  phpmyadmin:
+    image: phpmyadmin/phpmyadmin:latest
+    container_name: lfis-phpmyadmin
+    ports:
+      - "8081:80"
+    environment:
+      - PMA_HOST=db
+      - PMA_PORT=3306
+      - PMA_USER=lfis_user
+      - PMA_PASSWORD=lfis_pass
+    depends_on:
+      - db
+    networks:
+      - lfis-network
+
+volumes:
+  db-data:
+
+networks:
+  lfis-network:
+    driver: bridge

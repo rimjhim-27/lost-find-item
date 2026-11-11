@@ -1,0 +1,215 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+env:
+  PHP_VERSION: '8.2'
+  APP_DIR: 'Lost-And-Found-main'
+
+jobs:
+  lint-and-test:
+    name: Lint & Syntax Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ env.PHP_VERSION }}
+          extensions: mbstring, pdo, pdo_mysql, gd, fileinfo
+          coverage: none
+
+      - name: PHP Syntax Check
+        run: |
+          find ${{ env.APP_DIR }} -name "*.php" -not -path "*/vendor/*" -exec php -l {} \;
+
+      - name: PHPStan Static Analysis
+        run: |
+          composer require --dev phpstan/phpstan --no-interaction
+          ./vendor/bin/phpstan analyse ${{ env.APP_DIR }} --level=5 --no-progress || true
+
+      - name: Check for debug code
+        run: |
+          if grep -r "var_dump\|print_r\|die(\|exit(\|echo.*DEBUG" ${{ env.APP_DIR }} --include="*.php" | grep -v vendor; then
+            echo "Debug code found!"
+            exit 1
+          fi
+
+  database:
+    name: Database Validation
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: lfis_db
+        ports:
+          - 3306:3306
+        options: --health-cmd="mysqladmin ping" --health-interval=10s --health-timeout=5s --health-retries=3
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Wait for MySQL
+        run: |
+          for i in {1..30}; do
+            mysqladmin ping -h 127.0.0.1 -u root -proot && break
+            sleep 2
+          done
+
+      - name: Import Schema
+        run: |
+          mysql -h 127.0.0.1 -u root -proot lfis_db < ${{ env.APP_DIR }}/database/lfis_db.sql
+
+      - name: Verify Tables
+        run: |
+          mysql -h 127.0.0.1 -u root -proot lfis_db -e "SHOW TABLES;"
+
+  deploy-staging:
+    name: Deploy to Staging
+    needs: [lint-and-test, database]
+    if: github.ref == 'refs/heads/develop'
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.STAGING_HOST }}
+          username: ${{ secrets.STAGING_USER }}
+          key: ${{ secrets.STAGING_SSH_KEY }}
+          port: ${{ secrets.STAGING_PORT }}
+          script: |
+            cd /var/www/staging.lfis
+            rsync -avz --delete \
+              --exclude='.git' \
+              --exclude='.github' \
+              --exclude='database' \
+              --exclude='*.md' \
+              --exclude='config.php' \
+              --exclude='initialize.php' \
+              ${{ github.workspace }}/${{ env.APP_DIR }}/ .
+            php -l config.php
+            php -l initialize.php
+
+      - name: Run Database Migrations (Staging)
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.STAGING_HOST }}
+          username: ${{ secrets.STAGING_USER }}
+          key: ${{ secrets.STAGING_SSH_KEY }}
+          port: ${{ secrets.STAGING_PORT }}
+          script: |
+            cd /var/www/staging.lfis
+            mysql -u${{ secrets.STAGING_DB_USER }} -p${{ secrets.STAGING_DB_PASS }} ${{ secrets.STAGING_DB_NAME }} < database/lfis_db.sql
+
+      - name: Health Check Staging
+        run: |
+          curl -f https://staging.lfis.example.com/ || exit 1
+
+  deploy-production:
+    name: Deploy to Production
+    needs: [lint-and-test, database]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Create Release Tag
+        id: tag
+        run: |
+          TAG="v$(date +%Y%m%d-%H%M%S)"
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          git tag $TAG
+          git push origin $TAG
+
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.PROD_HOST }}
+          username: ${{ secrets.PROD_USER }}
+          key: ${{ secrets.PROD_SSH_KEY }}
+          port: ${{ secrets.PROD_PORT }}
+          script: |
+            cd /var/www/lfis
+            # Backup current version
+            cp -r . ../lfis-backup-$(date +%Y%m%d-%H%M%S)
+            # Deploy new version
+            rsync -avz --delete \
+              --exclude='.git' \
+              --exclude='.github' \
+              --exclude='database' \
+              --exclude='*.md' \
+              --exclude='config.php' \
+              --exclude='initialize.php' \
+              ${{ github.workspace }}/${{ env.APP_DIR }}/ .
+            php -l config.php
+            php -l initialize.php
+
+      - name: Run Database Migrations (Production)
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.PROD_HOST }}
+          username: ${{ secrets.PROD_USER }}
+          key: ${{ secrets.PROD_SSH_KEY }}
+          port: ${{ secrets.PROD_PORT }}
+          script: |
+            cd /var/www/lfis
+            # Backup database first
+            mysqldump -u${{ secrets.PROD_DB_USER }} -p${{ secrets.PROD_DB_PASS }} ${{ secrets.PROD_DB_NAME }} > ../db-backup-$(date +%Y%m%d-%H%M%S).sql
+            # Apply migrations
+            mysql -u${{ secrets.PROD_DB_USER }} -p${{ secrets.PROD_DB_PASS }} ${{ secrets.PROD_DB_NAME }} < database/lfis_db.sql
+
+      - name: Health Check Production
+        run: |
+          curl -f https://lfis.example.com/ || exit 1
+
+      - name: Notify Deployment
+        if: always()
+        run: |
+          STATUS="${{ job.status }}"
+          curl -X POST ${{ secrets.SLACK_WEBHOOK }} \
+            -H 'Content-Type: application/json' \
+            -d "{\"text\":\"LFIS Deployment to Production: $STATUS - ${{ steps.tag.outputs.tag }}\"}"
+
+  rollback:
+    name: Rollback Production
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: List Backups
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.PROD_HOST }}
+          username: ${{ secrets.PROD_USER }}
+          key: ${{ secrets.PROD_SSH_KEY }}
+          port: ${{ secrets.PROD_PORT }}
+          script: |
+            ls -la /var/www/lfis-backup-*
+
+      - name: Rollback to Previous Version
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.PROD_HOST }}
+          username: ${{ secrets.PROD_USER }}
+          key: ${{ secrets.PROD_SSH_KEY }}
+          port: ${{ secrets.PROD_PORT }}
+          script: |
+            cd /var/www
+            LATEST_BACKUP=$(ls -t lfis-backup-* | head -1)
+            rm -rf lfis
+            cp -r $LATEST_BACKUP lfis
+            echo "Rolled back to $LATEST_BACKUP"

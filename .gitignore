@@ -1,0 +1,47 @@
+# Dependencies
+vendor/
+node_modules/
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+storage/logs/
+
+# Uploads (keep directory, ignore contents)
+uploads/*
+!uploads/.gitkeep
+
+# Database
+*.sql
+*.sqlite
+
+# Docker
+docker/data/
+
+# Backup
+backups/
+*.backup
+
+# Testing
+.phpunit.result.cache
+coverage/
+
+# Composer
+composer.phar
+
+# Deployment
+deploy.sh
